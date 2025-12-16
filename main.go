@@ -904,6 +904,14 @@ func (v *Verifier) getReference(ctx context.Context, domain string) (string, str
 func (v *Verifier) testOrigin(ctx context.Context, ip, domain, refContent, refTitle string) VerifiedOrigin {
         result := VerifiedOrigin{IP: ip}
 
+        // Method 1: Check SSL certificate for domain
+        if v.checkSSLCert(ip, domain) {
+                result.Confidence = 0.85
+                result.Method = "ssl_cert_match"
+                return result
+        }
+
+        // Method 2: Host header injection (HTTPS then HTTP)
         for _, scheme := range []string{"https", "http"} {
                 req, _ := http.NewRequestWithContext(ctx, "GET", scheme+"://"+ip+"/", nil)
                 req.Header.Set("Host", domain)
@@ -920,24 +928,86 @@ func (v *Verifier) testOrigin(ctx context.Context, ip, domain, refContent, refTi
                 result.StatusCode = resp.StatusCode
                 result.Method = scheme + "_host_header"
 
-                if resp.StatusCode == 200 {
-                        result.Confidence = 0.5
+                // Accept 200, 301, 302 as valid responses
+                if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+                        result.Confidence = 0.4
                         content := string(body)
 
+                        // Check title match
                         titleRegex := regexp.MustCompile(`(?i)<title[^>]*>([^<]+)</title>`)
                         if m := titleRegex.FindStringSubmatch(content); len(m) > 1 {
                                 if strings.EqualFold(strings.TrimSpace(m[1]), refTitle) {
-                                        result.Confidence += 0.3
+                                        result.Confidence += 0.35
                                 }
                         }
 
-                        if sim := similarity(content, refContent); sim > 0.7 {
+                        // Check domain mentioned in response
+                        if strings.Contains(strings.ToLower(content), strings.ToLower(domain)) {
+                                result.Confidence += 0.1
+                        }
+
+                        // Check content similarity
+                        if sim := similarity(content, refContent); sim > 0.6 {
                                 result.Confidence = sim
                         }
-                        break
+
+                        // Check redirect location contains domain
+                        if loc := resp.Header.Get("Location"); loc != "" {
+                                if strings.Contains(loc, domain) {
+                                        result.Confidence += 0.2
+                                }
+                        }
+
+                        if result.Confidence > 0.3 {
+                                break
+                        }
                 }
         }
+
+        // Method 3: Direct IP request (no Host header) - lower confidence
+        if result.Confidence < 0.3 {
+                req, _ := http.NewRequestWithContext(ctx, "GET", "http://"+ip+"/", nil)
+                req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
+                if resp, err := v.client.Do(req); err == nil {
+                        body, _ := io.ReadAll(io.LimitReader(resp.Body, 50*1024))
+                        resp.Body.Close()
+                        content := string(body)
+                        if strings.Contains(strings.ToLower(content), strings.ToLower(domain)) {
+                                result.Confidence = 0.35
+                                result.Method = "domain_in_content"
+                                result.StatusCode = resp.StatusCode
+                        }
+                }
+        }
+
         return result
+}
+
+func (v *Verifier) checkSSLCert(ip, domain string) bool {
+        conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", ip+":443", &tls.Config{
+                InsecureSkipVerify: true,
+        })
+        if err != nil {
+                return false
+        }
+        defer conn.Close()
+
+        certs := conn.ConnectionState().PeerCertificates
+        if len(certs) == 0 {
+                return false
+        }
+
+        cert := certs[0]
+        // Check if domain matches cert CN or SANs
+        if strings.EqualFold(cert.Subject.CommonName, domain) {
+                return true
+        }
+        for _, san := range cert.DNSNames {
+                if strings.EqualFold(san, domain) || (strings.HasPrefix(san, "*.") && strings.HasSuffix(domain, san[1:])) {
+                        return true
+                }
+        }
+        return false
 }
 
 func similarity(s1, s2 string) float64 {
@@ -1241,6 +1311,9 @@ func (s *Scanner) printResult(r ScanResult, n, total int) {
         if len(r.VerifiedOrigins) > 0 {
                 best := r.VerifiedOrigins[0]
                 originStr = fmt.Sprintf("%s%s%s %s%.0f%%%s", green, best.IP, reset, dimGray, best.Confidence*100, reset)
+        } else if len(r.CandidateIPs) > 0 && !r.IsCloudflare {
+                // Show first candidate as unverified for non-CF domains
+                originStr = fmt.Sprintf("%s%s%s %s?%s", yellow, r.CandidateIPs[0], reset, dimGray, reset)
         }
 
         methodsUsed := []string{}
