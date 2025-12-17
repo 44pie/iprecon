@@ -125,19 +125,21 @@ func isCloudflareIP(ipStr string) bool {
 // Known CDN/Cloud provider ranges that should be excluded from origin results
 // These are typically mail servers, CDNs, or cloud services - not origin servers
 var knownCDNRanges = []string{
-        // Google
+        // Google (comprehensive)
         "142.250.0.0/15", "172.253.0.0/16", "64.233.160.0/19", "173.194.0.0/16",
         "192.178.0.0/15", "74.125.0.0/16", "216.58.192.0/19", "172.217.0.0/16",
+        "209.85.128.0/17", "216.239.32.0/19", "108.177.0.0/17", "8.8.8.0/24", "8.8.4.0/24",
+        "66.102.0.0/20", "66.249.64.0/19", "72.14.192.0/18", "64.18.0.0/20",
         // Amazon AWS (partial - major ranges)
-        "52.0.0.0/11", "54.0.0.0/10", "35.0.0.0/12",
+        "52.0.0.0/11", "54.0.0.0/10", "35.0.0.0/12", "3.0.0.0/8",
         // Microsoft Azure (partial)
-        "13.64.0.0/11", "40.64.0.0/10", "20.0.0.0/11",
+        "13.64.0.0/11", "40.64.0.0/10", "20.0.0.0/11", "51.0.0.0/8",
         // Fastly
         "151.101.0.0/16", "199.232.0.0/16",
         // Akamai (partial)
-        "23.0.0.0/12", "104.64.0.0/10",
+        "23.0.0.0/12", "104.64.0.0/10", "2.16.0.0/13",
         // DigitalOcean
-        "167.99.0.0/16", "206.189.0.0/16",
+        "167.99.0.0/16", "206.189.0.0/16", "134.209.0.0/16", "139.59.0.0/16",
 }
 
 var cdnNets []*net.IPNet
@@ -379,7 +381,8 @@ func (c *ContentParser) extractIPsFromContent(ctx context.Context, domain string
         }
 
         for _, url := range urls {
-                req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+                req, reqErr := http.NewRequestWithContext(ctx, "GET", url, nil)
+                if reqErr != nil || req == nil { continue }
                 req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
                 
                 resp, err := c.client.Do(req)
@@ -422,7 +425,8 @@ func (c *ContentParser) triggerErrorPages(ctx context.Context, domain string) []
         }
 
         for _, path := range errorPaths {
-                req, _ := http.NewRequestWithContext(ctx, "GET", "https://"+domain+path, nil)
+                req, reqErr := http.NewRequestWithContext(ctx, "GET", "https://"+domain+path, nil)
+                if reqErr != nil || req == nil { continue }
                 req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
                 
                 resp, err := c.client.Do(req)
@@ -451,7 +455,8 @@ func (c *ContentParser) parseRobotsSitemap(ctx context.Context, domain string) [
         seen := make(map[string]bool)
         
         // Check robots.txt for Sitemap directive with different host
-        req, _ := http.NewRequestWithContext(ctx, "GET", "https://"+domain+"/robots.txt", nil)
+        req, reqErr := http.NewRequestWithContext(ctx, "GET", "https://"+domain+"/robots.txt", nil)
+        if reqErr != nil || req == nil { return nil }
         resp, err := c.client.Do(req)
         if err == nil {
                 body, _ := io.ReadAll(io.LimitReader(resp.Body, 50*1024))
@@ -611,7 +616,8 @@ func (c *CrtshModule) getSubdomains(ctx context.Context, domain string) ([]strin
         }
 
         url := fmt.Sprintf("https://crt.sh/?q=%%.%s&output=json", domain)
-        req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+        req, reqErr := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if reqErr != nil || req == nil { return []string{domain}, nil }
         req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 
         resp, err := c.client.Do(req)
@@ -665,7 +671,8 @@ func (w *WaybackModule) getSubdomains(ctx context.Context, domain string) []stri
         }
 
         url := fmt.Sprintf("https://web.archive.org/cdx/search?url=*.%s/*&output=json&fl=original&collapse=urlkey&limit=5000", domain)
-        req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+        req, reqErr := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if reqErr != nil || req == nil { return nil }
         req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 
         resp, err := w.client.Do(req)
@@ -725,7 +732,8 @@ func (r *RapidDNSModule) getSubdomains(ctx context.Context, domain string) []str
         }
 
         url := fmt.Sprintf("https://rapiddns.io/subdomain/%s?full=1", domain)
-        req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+        req, reqErr := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if reqErr != nil || req == nil { return nil }
         req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 
         resp, err := r.client.Do(req)
@@ -777,7 +785,8 @@ func (s *SubdomainCenterModule) getSubdomains(ctx context.Context, domain string
         }
 
         url := fmt.Sprintf("https://api.subdomain.center/?domain=%s", domain)
-        req, _ := http.NewRequestWithContext(shortCtx, "GET", url, nil)
+        req, reqErr := http.NewRequestWithContext(shortCtx, "GET", url, nil)
+        if reqErr != nil || req == nil { return nil }
         req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 
         resp, err := s.client.Do(req)
@@ -828,7 +837,8 @@ func (t *ThreatCrowdModule) getSubdomains(ctx context.Context, domain string) []
         }
 
         url := fmt.Sprintf("https://www.threatcrowd.org/searchApi/v2/domain/report/?domain=%s", domain)
-        req, _ := http.NewRequestWithContext(shortCtx, "GET", url, nil)
+        req, reqErr := http.NewRequestWithContext(shortCtx, "GET", url, nil)
+        if reqErr != nil || req == nil { return nil }
         req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 
         resp, err := t.client.Do(req)
@@ -862,7 +872,8 @@ func (t *ThreatCrowdModule) getIPs(ctx context.Context, domain string) []string 
         }
 
         url := fmt.Sprintf("https://www.threatcrowd.org/searchApi/v2/domain/report/?domain=%s", domain)
-        req, _ := http.NewRequestWithContext(shortCtx, "GET", url, nil)
+        req, reqErr := http.NewRequestWithContext(shortCtx, "GET", url, nil)
+        if reqErr != nil || req == nil { return nil }
 
         resp, err := t.client.Do(req)
         if err != nil {
@@ -950,7 +961,8 @@ func (h *HistoryModule) checkHackerTarget(ctx context.Context, domain string) []
         }
 
         url := "https://api.hackertarget.com/hostsearch/?q=" + domain
-        req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+        req, reqErr := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if reqErr != nil || req == nil { return nil }
         resp, err := h.client.Do(req)
         if err != nil {
                 return nil
@@ -978,7 +990,8 @@ func (h *HistoryModule) checkAlienVault(ctx context.Context, domain string) []st
         }
 
         url := fmt.Sprintf("https://otx.alienvault.com/api/v1/indicators/domain/%s/passive_dns", domain)
-        req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+        req, reqErr := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if reqErr != nil || req == nil { return nil }
         req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 
         resp, err := h.client.Do(req)
@@ -1036,7 +1049,8 @@ func (c *CrimeFlareModule) loadDB(ctx context.Context) {
         }
 
         url := "https://cf.ozeliurs.com/ipout"
-        req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+        req, reqErr := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if reqErr != nil || req == nil { return }
         req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 
         resp, err := c.client.Do(req)
@@ -1094,7 +1108,8 @@ func (v *ViewDNSModule) getHistoricalIPs(ctx context.Context, domain string) []s
         }
 
         url := fmt.Sprintf("https://viewdns.info/iphistory/?domain=%s", domain)
-        req, _ := http.NewRequestWithContext(shortCtx, "GET", url, nil)
+        req, reqErr := http.NewRequestWithContext(shortCtx, "GET", url, nil)
+        if reqErr != nil || req == nil { return nil }
         req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0")
         req.Header.Set("Accept", "text/html,application/xhtml+xml")
 
@@ -1147,7 +1162,8 @@ func (f *FaviconModule) getFaviconHash(ctx context.Context, domain string) strin
         }
 
         for _, url := range urls {
-                req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+                req, reqErr := http.NewRequestWithContext(ctx, "GET", url, nil)
+                if reqErr != nil || req == nil { continue }
                 req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 
                 resp, err := f.client.Do(req)
@@ -1196,7 +1212,8 @@ func newVerifier(timeout time.Duration) *Verifier {
 }
 
 func (v *Verifier) getReference(ctx context.Context, domain string) (string, string) {
-        req, _ := http.NewRequestWithContext(ctx, "GET", "https://"+domain, nil)
+        req, reqErr := http.NewRequestWithContext(ctx, "GET", "https://"+domain, nil)
+        if reqErr != nil || req == nil { return "", "" }
         req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 
         resp, err := v.client.Do(req)
@@ -1228,7 +1245,10 @@ func (v *Verifier) testOrigin(ctx context.Context, ip, domain, refContent, refTi
 
         // Method 2: Host header injection (HTTPS then HTTP)
         for _, scheme := range []string{"https", "http"} {
-                req, _ := http.NewRequestWithContext(ctx, "GET", scheme+"://"+ip+"/", nil)
+                req, err := http.NewRequestWithContext(ctx, "GET", scheme+"://"+ip+"/", nil)
+                if err != nil || req == nil {
+                        continue
+                }
                 req.Header.Set("Host", domain)
                 req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
 
@@ -1281,7 +1301,10 @@ func (v *Verifier) testOrigin(ctx context.Context, ip, domain, refContent, refTi
 
         // Method 3: Direct IP request (no Host header) - lower confidence
         if result.Confidence < 0.3 {
-                req, _ := http.NewRequestWithContext(ctx, "GET", "http://"+ip+"/", nil)
+                req, err := http.NewRequestWithContext(ctx, "GET", "http://"+ip+"/", nil)
+                if err != nil || req == nil {
+                        return result
+                }
                 req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
                 if resp, err := v.client.Do(req); err == nil {
                         body, _ := io.ReadAll(io.LimitReader(resp.Body, 50*1024))
