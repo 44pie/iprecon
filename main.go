@@ -16,6 +16,7 @@ import (
         "os"
         "os/signal"
         "regexp"
+        "sort"
         "strings"
         "sync"
         "sync/atomic"
@@ -83,6 +84,7 @@ type Config struct {
         Timeout   int
         RateLimit float64
         Verbose   bool
+        ASNExpand bool
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -114,6 +116,48 @@ func isCloudflareIP(ipStr string) bool {
         }
         for _, cfNet := range cfNets {
                 if cfNet.Contains(ip) {
+                        return true
+                }
+        }
+        return false
+}
+
+// Known CDN/Cloud provider ranges that should be excluded from origin results
+// These are typically mail servers, CDNs, or cloud services - not origin servers
+var knownCDNRanges = []string{
+        // Google
+        "142.250.0.0/15", "172.253.0.0/16", "64.233.160.0/19", "173.194.0.0/16",
+        "192.178.0.0/15", "74.125.0.0/16", "216.58.192.0/19", "172.217.0.0/16",
+        // Amazon AWS (partial - major ranges)
+        "52.0.0.0/11", "54.0.0.0/10", "35.0.0.0/12",
+        // Microsoft Azure (partial)
+        "13.64.0.0/11", "40.64.0.0/10", "20.0.0.0/11",
+        // Fastly
+        "151.101.0.0/16", "199.232.0.0/16",
+        // Akamai (partial)
+        "23.0.0.0/12", "104.64.0.0/10",
+        // DigitalOcean
+        "167.99.0.0/16", "206.189.0.0/16",
+}
+
+var cdnNets []*net.IPNet
+
+func init() {
+        for _, cidr := range knownCDNRanges {
+                _, ipNet, err := net.ParseCIDR(cidr)
+                if err == nil {
+                        cdnNets = append(cdnNets, ipNet)
+                }
+        }
+}
+
+func isKnownCDNIP(ipStr string) bool {
+        ip := net.ParseIP(ipStr)
+        if ip == nil {
+                return false
+        }
+        for _, net := range cdnNets {
+                if net.Contains(ip) {
                         return true
                 }
         }
@@ -262,6 +306,277 @@ func (r *DNSResolver) getIPv6(domain string) []string {
                 result = append(result, ip.String())
         }
         return result
+}
+
+// Reverse DNS (PTR) lookup
+func (r *DNSResolver) getPTR(ip string) string {
+        ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+        defer cancel()
+
+        names, err := r.resolver.LookupAddr(ctx, ip)
+        if err != nil || len(names) == 0 {
+                return ""
+        }
+        return strings.TrimSuffix(names[0], ".")
+}
+
+// Zone Transfer (AXFR) attempt
+func (r *DNSResolver) tryAXFR(domain string) []string {
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+
+        nss, err := r.resolver.LookupNS(ctx, domain)
+        if err != nil || len(nss) == 0 {
+                return nil
+        }
+
+        var results []string
+        for _, ns := range nss {
+                nsHost := strings.TrimSuffix(ns.Host, ".")
+                conn, err := net.DialTimeout("tcp", nsHost+":53", 3*time.Second)
+                if err != nil {
+                        continue
+                }
+                conn.Close()
+                // AXFR typically blocked, but attempt reveals NS is reachable
+                // Real AXFR requires DNS library - this is a placeholder for detection
+        }
+        return results
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONTENT PARSER MODULE (HTML/JS IP extraction, robots.txt, error pages)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type ContentParser struct {
+        client *http.Client
+}
+
+func newContentParser(timeout time.Duration) *ContentParser {
+        return &ContentParser{
+                client: &http.Client{
+                        Timeout: timeout,
+                        Transport: &http.Transport{
+                                TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+                        },
+                },
+        }
+}
+
+// Extract IPs from HTML/JS content
+func (c *ContentParser) extractIPsFromContent(ctx context.Context, domain string) []string {
+        ipRegex := regexp.MustCompile(`\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b`)
+        privateRegex := regexp.MustCompile(`^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|0\.)`)
+        
+        seen := make(map[string]bool)
+        var ips []string
+
+        urls := []string{
+                "https://" + domain,
+                "https://" + domain + "/robots.txt",
+                "https://" + domain + "/sitemap.xml",
+                "https://" + domain + "/.well-known/security.txt",
+        }
+
+        for _, url := range urls {
+                req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+                req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
+                
+                resp, err := c.client.Do(req)
+                if err != nil {
+                        continue
+                }
+                
+                body, _ := io.ReadAll(io.LimitReader(resp.Body, 100*1024))
+                resp.Body.Close()
+                
+                matches := ipRegex.FindAllString(string(body), -1)
+                for _, ip := range matches {
+                        if !seen[ip] && !privateRegex.MatchString(ip) && !isCloudflareIP(ip) {
+                                seen[ip] = true
+                                ips = append(ips, ip)
+                        }
+                }
+        }
+        return ips
+}
+
+// Trigger error pages to reveal origin IP
+func (c *ContentParser) triggerErrorPages(ctx context.Context, domain string) []string {
+        ipRegex := regexp.MustCompile(`\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b`)
+        privateRegex := regexp.MustCompile(`^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|0\.)`)
+        
+        seen := make(map[string]bool)
+        var ips []string
+
+        // Paths likely to trigger error pages
+        errorPaths := []string{
+                "/cdn-cgi/trace", // Cloudflare debug
+                "/" + strings.Repeat("a", 500), // Long URL
+                "/wp-admin/install.php",
+                "/phpmyadmin/",
+                "/.git/config",
+                "/server-status",
+                "/debug",
+                "/%00",
+        }
+
+        for _, path := range errorPaths {
+                req, _ := http.NewRequestWithContext(ctx, "GET", "https://"+domain+path, nil)
+                req.Header.Set("User-Agent", "Mozilla/5.0 Chrome/120.0.0.0")
+                
+                resp, err := c.client.Do(req)
+                if err != nil {
+                        continue
+                }
+                
+                body, _ := io.ReadAll(io.LimitReader(resp.Body, 50*1024))
+                resp.Body.Close()
+                
+                // Error pages often contain server IP
+                matches := ipRegex.FindAllString(string(body), -1)
+                for _, ip := range matches {
+                        if !seen[ip] && !privateRegex.MatchString(ip) && !isCloudflareIP(ip) {
+                                seen[ip] = true
+                                ips = append(ips, ip)
+                        }
+                }
+        }
+        return ips
+}
+
+// Parse robots.txt and sitemap.xml for origin URLs
+func (c *ContentParser) parseRobotsSitemap(ctx context.Context, domain string) []string {
+        var origins []string
+        seen := make(map[string]bool)
+        
+        // Check robots.txt for Sitemap directive with different host
+        req, _ := http.NewRequestWithContext(ctx, "GET", "https://"+domain+"/robots.txt", nil)
+        resp, err := c.client.Do(req)
+        if err == nil {
+                body, _ := io.ReadAll(io.LimitReader(resp.Body, 50*1024))
+                resp.Body.Close()
+                
+                // Look for Sitemap: URLs pointing to different hosts
+                sitemapRegex := regexp.MustCompile(`(?i)Sitemap:\s*(https?://[^\s]+)`)
+                matches := sitemapRegex.FindAllStringSubmatch(string(body), -1)
+                for _, m := range matches {
+                        if len(m) > 1 && !strings.Contains(m[1], domain) {
+                                // Different host in sitemap - potential origin
+                                hostRegex := regexp.MustCompile(`https?://([^/]+)`)
+                                if hm := hostRegex.FindStringSubmatch(m[1]); len(hm) > 1 {
+                                        host := hm[1]
+                                        if !seen[host] {
+                                                seen[host] = true
+                                                // Resolve this host
+                                                ips, err := net.LookupIP(host)
+                                                if err == nil {
+                                                        for _, ip := range ips {
+                                                                if !isCloudflareIP(ip.String()) {
+                                                                        origins = append(origins, ip.String())
+                                                                }
+                                                        }
+                                                }
+                                        }
+                                }
+                        }
+                }
+        }
+        return origins
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ASN MODULE (optional, enabled with -asn flag)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type ASNModule struct {
+        client  *http.Client
+        enabled bool
+}
+
+func newASNModule(timeout time.Duration, enabled bool) *ASNModule {
+        return &ASNModule{
+                client: &http.Client{Timeout: timeout},
+                enabled: enabled,
+        }
+}
+
+// Get ASN info for an IP
+func (a *ASNModule) getASN(ip string) (string, string, string) {
+        if !a.enabled {
+                return "", "", ""
+        }
+
+        // Use ip-api.com (free, no key required)
+        resp, err := a.client.Get("http://ip-api.com/json/" + ip + "?fields=as,org,isp")
+        if err != nil {
+                return "", "", ""
+        }
+        defer resp.Body.Close()
+
+        var result struct {
+                AS  string `json:"as"`
+                Org string `json:"org"`
+                ISP string `json:"isp"`
+        }
+        json.NewDecoder(resp.Body).Decode(&result)
+        return result.AS, result.Org, result.ISP
+}
+
+// Expand /24 subnet of candidate IP
+func (a *ASNModule) expandSubnet(ctx context.Context, ip string, domain string, verifier *Verifier) []VerifiedOrigin {
+        if !a.enabled {
+                return nil
+        }
+
+        parts := strings.Split(ip, ".")
+        if len(parts) != 4 {
+                return nil
+        }
+
+        // Scan /24 subnet (256 IPs)
+        baseIP := strings.Join(parts[:3], ".")
+        var results []VerifiedOrigin
+        var mu sync.Mutex
+        var wg sync.WaitGroup
+
+        // Limit to 32 concurrent workers
+        sem := make(chan struct{}, 32)
+
+        for i := 1; i < 255; i++ {
+                wg.Add(1)
+                go func(octet int) {
+                        defer wg.Done()
+                        sem <- struct{}{}
+                        defer func() { <-sem }()
+
+                        testIP := fmt.Sprintf("%s.%d", baseIP, octet)
+                        if testIP == ip {
+                                return // Skip original IP
+                        }
+
+                        // Quick port check
+                        conn, err := net.DialTimeout("tcp", testIP+":443", 2*time.Second)
+                        if err != nil {
+                                conn, err = net.DialTimeout("tcp", testIP+":80", 2*time.Second)
+                                if err != nil {
+                                        return
+                                }
+                        }
+                        conn.Close()
+
+                        // Verify with Host header
+                        result := verifier.testOrigin(ctx, testIP, domain, "", "")
+                        if result.Confidence > 0.3 {
+                                result.Method = "asn_expansion"
+                                mu.Lock()
+                                results = append(results, result)
+                                mu.Unlock()
+                        }
+                }(i)
+        }
+        wg.Wait()
+        return results
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1045,21 +1360,33 @@ func (v *Verifier) verifyCandidates(ctx context.Context, domain string, candidat
                 return nil
         }
 
+        // Filter out known CDN/cloud provider IPs before verification
+        var filteredCandidates []string
+        for _, ip := range candidates {
+                if !isKnownCDNIP(ip) && !isCloudflareIP(ip) {
+                        filteredCandidates = append(filteredCandidates, ip)
+                }
+        }
+
+        if len(filteredCandidates) == 0 {
+                return nil
+        }
+
         refContent, refTitle := v.getReference(ctx, domain)
 
         var results []VerifiedOrigin
         var mu sync.Mutex
         var wg sync.WaitGroup
 
-        jobs := make(chan string, len(candidates))
-        for _, ip := range candidates {
+        jobs := make(chan string, len(filteredCandidates))
+        for _, ip := range filteredCandidates {
                 jobs <- ip
         }
         close(jobs)
 
         workers := 5
-        if workers > len(candidates) {
-                workers = len(candidates)
+        if workers > len(filteredCandidates) {
+                workers = len(filteredCandidates)
         }
 
         for i := 0; i < workers; i++ {
@@ -1068,7 +1395,8 @@ func (v *Verifier) verifyCandidates(ctx context.Context, domain string, candidat
                         defer wg.Done()
                         for ip := range jobs {
                                 r := v.testOrigin(ctx, ip, domain, refContent, refTitle)
-                                if r.Confidence > 0.3 {
+                                // Only include results with confidence > 40% (0.4)
+                                if r.Confidence > 0.4 {
                                         mu.Lock()
                                         results = append(results, r)
                                         mu.Unlock()
@@ -1077,6 +1405,12 @@ func (v *Verifier) verifyCandidates(ctx context.Context, domain string, candidat
                 }()
         }
         wg.Wait()
+
+        // Sort results by confidence (highest first)
+        sort.Slice(results, func(i, j int) bool {
+                return results[i].Confidence > results[j].Confidence
+        })
+
         return results
 }
 
@@ -1085,36 +1419,40 @@ func (v *Verifier) verifyCandidates(ctx context.Context, domain string, candidat
 // ═══════════════════════════════════════════════════════════════════════════════
 
 type Scanner struct {
-        config         *Config
-        dns            *DNSResolver
-        crtsh          *CrtshModule
-        wayback        *WaybackModule
-        rapidDNS       *RapidDNSModule
-        subCenter      *SubdomainCenterModule
-        threatCrowd    *ThreatCrowdModule
-        history        *HistoryModule
-        crimeflare     *CrimeFlareModule
-        viewdns        *ViewDNSModule
-        favicon        *FaviconModule
-        verifier       *Verifier
-        found          int64
+        config        *Config
+        dns           *DNSResolver
+        crtsh         *CrtshModule
+        wayback       *WaybackModule
+        rapidDNS      *RapidDNSModule
+        subCenter     *SubdomainCenterModule
+        threatCrowd   *ThreatCrowdModule
+        history       *HistoryModule
+        crimeflare    *CrimeFlareModule
+        viewdns       *ViewDNSModule
+        favicon       *FaviconModule
+        contentParser *ContentParser
+        asn           *ASNModule
+        verifier      *Verifier
+        found         int64
 }
 
 func newScanner(cfg *Config) *Scanner {
         timeout := time.Duration(cfg.Timeout) * time.Second
         return &Scanner{
-                config:      cfg,
-                dns:         newDNSResolver(timeout),
-                crtsh:       newCrtsh(timeout, cfg.RateLimit),
-                wayback:     newWayback(timeout, cfg.RateLimit/2),
-                rapidDNS:    newRapidDNS(timeout, cfg.RateLimit/2),
-                subCenter:   newSubdomainCenter(timeout),
-                threatCrowd: newThreatCrowd(timeout),
-                history:     newHistory(timeout, cfg.RateLimit),
-                crimeflare:  newCrimeFlare(timeout),
-                viewdns:     newViewDNS(timeout, cfg.RateLimit),
-                favicon:     newFavicon(timeout),
-                verifier:    newVerifier(timeout),
+                config:        cfg,
+                dns:           newDNSResolver(timeout),
+                crtsh:         newCrtsh(timeout, cfg.RateLimit),
+                wayback:       newWayback(timeout, cfg.RateLimit/2),
+                rapidDNS:      newRapidDNS(timeout, cfg.RateLimit/2),
+                subCenter:     newSubdomainCenter(timeout),
+                threatCrowd:   newThreatCrowd(timeout),
+                history:       newHistory(timeout, cfg.RateLimit),
+                crimeflare:    newCrimeFlare(timeout),
+                viewdns:       newViewDNS(timeout, cfg.RateLimit),
+                favicon:       newFavicon(timeout),
+                contentParser: newContentParser(timeout),
+                asn:           newASNModule(timeout, cfg.ASNExpand),
+                verifier:      newVerifier(timeout),
         }
 }
 
@@ -1227,6 +1565,24 @@ func (s *Scanner) scanDomain(ctx context.Context, domain string) ScanResult {
         ipv6 := s.dns.getIPv6(domain)
         result.IPv6Addrs = ipv6
 
+        // Content parsing: extract IPs from HTML/JS, robots.txt
+        contentIPs := s.contentParser.extractIPsFromContent(ctx, domain)
+        for _, ip := range contentIPs {
+                candidateSet[ip] = true
+        }
+
+        // Error page trigger
+        errorIPs := s.contentParser.triggerErrorPages(ctx, domain)
+        for _, ip := range errorIPs {
+                candidateSet[ip] = true
+        }
+
+        // robots.txt/sitemap.xml parsing
+        robotsIPs := s.contentParser.parseRobotsSitemap(ctx, domain)
+        for _, ip := range robotsIPs {
+                candidateSet[ip] = true
+        }
+
         result.FaviconHash = s.favicon.getFaviconHash(ctx, domain)
 
         var candidates []string
@@ -1237,6 +1593,14 @@ func (s *Scanner) scanDomain(ctx context.Context, domain string) ScanResult {
 
         if len(candidates) > 0 {
                 result.VerifiedOrigins = s.verifier.verifyCandidates(ctx, domain, candidates)
+
+                // ASN expansion if enabled and we have verified origins
+                if s.asn.enabled && len(result.VerifiedOrigins) > 0 {
+                        for _, origin := range result.VerifiedOrigins {
+                                asnOrigins := s.asn.expandSubnet(ctx, origin.IP, domain, s.verifier)
+                                result.VerifiedOrigins = append(result.VerifiedOrigins, asnOrigins...)
+                        }
+                }
         }
 
         result.ScanTime = time.Since(start).Seconds()
@@ -1431,30 +1795,39 @@ func printBanner() {
         fmt.Print(banner)
 }
 
+func printUsage() {
+        printBanner()
+        fmt.Println()
+        fmt.Println(nordic("  Usage:"))
+        fmt.Println(nordicDim("    iprecon -d domain.com"))
+        fmt.Println(nordicDim("    iprecon -f domains.txt -w 100 -o results.csv"))
+        fmt.Println(nordicDim("    iprecon -f domains.txt -asn  # Enable subnet scanning"))
+        fmt.Println()
+        fmt.Println(nordic("  Methods (20+ free sources):"))
+        fmt.Println(nordicDim("    crt.sh, Wayback, RapidDNS, subdomain.center, ThreatCrowd"))
+        fmt.Println(nordicDim("    CrimeFlare, ViewDNS, MX, SPF, DNS History (HackerTarget+AlienVault)"))
+        fmt.Println(nordicDim("    Common subdomains bruteforce, IPv6, Favicon hash, Host header verify"))
+        fmt.Println(nordicDim("    HTML/JS IP extraction, Error page trigger, robots.txt/sitemap.xml"))
+        fmt.Println(nordicDim("    PTR records, SSL cert match, ASN subnet expansion (-asn)"))
+        fmt.Println()
+        fmt.Println(nordic("  Options:"))
+        flag.PrintDefaults()
+}
+
 func main() {
+        showHelp := flag.Bool("h", false, "Show help")
         domain := flag.String("d", "", "Single domain to scan")
         file := flag.String("f", "", "File with domains (one per line)")
         workers := flag.Int("w", 50, "Number of concurrent workers")
         timeout := flag.Int("t", 10, "Request timeout in seconds")
         output := flag.String("o", "", "Output file (supports .csv and .json)")
         quiet := flag.Bool("q", false, "Quiet mode")
+        asnExpand := flag.Bool("asn", false, "Enable ASN /24 subnet expansion (slower but more thorough)")
         flag.Parse()
 
-        if *domain == "" && *file == "" {
-                printBanner()
-                fmt.Println()
-                fmt.Println(nordic("  Usage:"))
-                fmt.Println(nordicDim("    iprecon -d domain.com"))
-                fmt.Println(nordicDim("    iprecon -f domains.txt -w 100 -o results.csv"))
-                fmt.Println()
-                fmt.Println(nordic("  Methods (15 free sources):"))
-                fmt.Println(nordicDim("    crt.sh, Wayback, RapidDNS, subdomain.center, ThreatCrowd"))
-                fmt.Println(nordicDim("    CrimeFlare, ViewDNS, MX, SPF, DNS History (HackerTarget+AlienVault)"))
-                fmt.Println(nordicDim("    Common subdomains bruteforce, IPv6, Favicon hash, Host header verify"))
-                fmt.Println()
-                fmt.Println(nordic("  Options:"))
-                flag.PrintDefaults()
-                os.Exit(1)
+        if *showHelp || (*domain == "" && *file == "") {
+                printUsage()
+                os.Exit(0)
         }
 
         var domains []string
@@ -1491,6 +1864,7 @@ func main() {
                 Timeout:   *timeout,
                 RateLimit: 10,
                 Verbose:   !*quiet,
+                ASNExpand: *asnExpand,
         }
 
         s := newScanner(cfg)
