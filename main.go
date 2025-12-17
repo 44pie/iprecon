@@ -92,10 +92,14 @@ type Config struct {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 var cloudflareRanges = []string{
+        // IPv4
         "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
         "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
         "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
         "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+        // IPv6
+        "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+        "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
 }
 
 var cfNets []*net.IPNet
@@ -122,24 +126,14 @@ func isCloudflareIP(ipStr string) bool {
         return false
 }
 
-// Known CDN/Cloud provider ranges that should be excluded from origin results
-// These are typically mail servers, CDNs, or cloud services - not origin servers
+// Known CDN/Cloud provider ranges to exclude - ONLY mail/CDN services, NOT hosting providers
+// We keep this minimal to avoid filtering out valid origin servers on AWS/Azure/DO/etc.
 var knownCDNRanges = []string{
-        // Google (comprehensive)
+        // Google Mail/CDN services only (these are never origin servers)
         "142.250.0.0/15", "172.253.0.0/16", "64.233.160.0/19", "173.194.0.0/16",
         "192.178.0.0/15", "74.125.0.0/16", "216.58.192.0/19", "172.217.0.0/16",
         "209.85.128.0/17", "216.239.32.0/19", "108.177.0.0/17", "8.8.8.0/24", "8.8.4.0/24",
-        "66.102.0.0/20", "66.249.64.0/19", "72.14.192.0/18", "64.18.0.0/20",
-        // Amazon AWS (partial - major ranges)
-        "52.0.0.0/11", "54.0.0.0/10", "35.0.0.0/12", "3.0.0.0/8",
-        // Microsoft Azure (partial)
-        "13.64.0.0/11", "40.64.0.0/10", "20.0.0.0/11", "51.0.0.0/8",
-        // Fastly
-        "151.101.0.0/16", "199.232.0.0/16",
-        // Akamai (partial)
-        "23.0.0.0/12", "104.64.0.0/10", "2.16.0.0/13",
-        // DigitalOcean
-        "167.99.0.0/16", "206.189.0.0/16", "134.209.0.0/16", "139.59.0.0/16",
+        // Note: AWS, Azure, DigitalOcean, Hetzner etc. are NOT filtered - they host real origin servers
 }
 
 var cdnNets []*net.IPNet
@@ -1418,8 +1412,8 @@ func (v *Verifier) verifyCandidates(ctx context.Context, domain string, candidat
                         defer wg.Done()
                         for ip := range jobs {
                                 r := v.testOrigin(ctx, ip, domain, refContent, refTitle)
-                                // Only include results with confidence > 40% (0.4)
-                                if r.Confidence > 0.4 {
+                                // Only include results with confidence > 30% (0.3)
+                                if r.Confidence > 0.3 {
                                         mu.Lock()
                                         results = append(results, r)
                                         mu.Unlock()
